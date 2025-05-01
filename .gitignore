@@ -1,0 +1,5 @@
+/data_inputs
+/data_outputs
+*.png
+*.wav
+*.npz

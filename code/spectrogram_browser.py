@@ -1,1 +1,0 @@
-## Please write a python script that will take a directory of audio files and display a spectrogram of each file.
