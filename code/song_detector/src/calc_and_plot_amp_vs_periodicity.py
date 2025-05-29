@@ -35,7 +35,7 @@ from calculate_spectrogram_periodicity import calculate_spectrogram_periodicity
 def batch_periodicity_vs_amplitude(
     folder: str | Path,
     *,
-    plot_each_spec: bool = False,
+    plot_each_spec: bool = True,
     low_mod: float = 10,
     high_mod: float = 30,
     smoothing_sigma: float = 0.7,
@@ -72,7 +72,7 @@ def batch_periodicity_vs_amplitude(
         # (b) periodicity & feature extraction
         spec_data = calculate_spectrogram_periodicity(
             str(npz_file),
-            plot_figures=False,
+            plot_figures=True, #if you want the periodicity figures to show up
             low_mod=low_mod,
             high_mod=high_mod,
             smoothing_sigma=smoothing_sigma,
@@ -155,7 +155,7 @@ if __name__ == "__main__":
 
     batch_periodicity_vs_amplitude(
         folder=folder_path,
-        plot_each_spec=False,
+        plot_each_spec=True,
         low_mod=10,
         high_mod=30,
         smoothing_sigma=0.7,
