@@ -37,7 +37,7 @@ def batch_periodicity_vs_amplitude(
     *,
     plot_each_spec: bool = True,
     low_mod: float = 10,
-    high_mod: float = 30,
+    high_mod: float = 40,
     smoothing_sigma: float = 0.7,
     power_threshold: float = 0.2,
     segment_duration: float = 10,
@@ -61,6 +61,9 @@ def batch_periodicity_vs_amplitude(
 
     # ── iterate over files ──────────────────────────────────────
     for npz_file in sorted(folder.glob("*.npz")):
+        if npz_file.name.startswith("._"):
+            continue
+
         print(f"Processing {npz_file.name}")
 
         # (a) visualisation (optional)
@@ -114,6 +117,7 @@ def batch_periodicity_vs_amplitude(
         plt.scatter(x, y, s=7, c=colours, alpha=0.6)
         plt.plot(x_line, y_line, "b--", lw=2, label="decision boundary")
         plt.xlabel("z-scored log-amplitude")
+        plt.ylim(-0.1, 1.1)
         plt.ylabel("Periodicity")
         plt.title(title)
         plt.legend(
@@ -149,15 +153,14 @@ def batch_periodicity_vs_amplitude(
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     folder_path = (
-        "/Users/mirandahulsey-vincent/Documents/allPythonCode/"
-        "BYOD_class/data_inputs/sample_GV_groundtruth_npzs"
+        "/Volumes/my_own_SSD/labeled_song_dataset/train"
     )
 
     batch_periodicity_vs_amplitude(
         folder=folder_path,
         plot_each_spec=True,
         low_mod=10,
-        high_mod=30,
+        high_mod=40,
         smoothing_sigma=0.7,
         power_threshold=0.2,
         segment_duration=10,
