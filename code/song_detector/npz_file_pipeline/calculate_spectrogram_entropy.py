@@ -41,7 +41,6 @@ python calculate_dual_entropy.py segment.npz --sigma 10 \
 
 from pathlib import Path
 from typing import List, Tuple, Dict, Union, Any
-
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
