@@ -99,7 +99,7 @@ def mask_to_spans(mask: np.ndarray, times: np.ndarray) -> List[Tuple[float, floa
 # Main function
 # ────────────────────────────────────────────────────────────────────────────
 
-def calculate_spectrogram_entropy(
+def calculate_npz_spectrogram_entropy(
     input_data: Union[str, dict],
     *,
     smoothing_sigma: float = 20,
