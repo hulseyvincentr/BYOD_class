@@ -4,4 +4,4 @@
 *.wav
 *.npz
 *.rhs
-*.rhs
+*.json
