@@ -77,8 +77,13 @@ def run_all_wav(wav_path: Path | str, *, show_plots: bool = False):
 
 
 def _merge_metrics(amp_per, ent) -> Dict[str, Any]:
-    """Flatten two dataclass instances into ONE dict."""
-    return {**vars(amp_per), **vars(ent)}
+    """Keep only the detected song spans, discard full feature arrays."""
+    return {
+        "amplitude_detected_song_times": _json_ready(amp_per.amplitude_detected_song_times),
+        "periodicity_detected_song_times": _json_ready(amp_per.periodicity_detected_song_times),
+        "shannon_detected_song_times": _json_ready(ent.shannon_detected_song_times),
+        "wiener_detected_song_times": _json_ready(ent.wiener_detected_song_times),
+    }
 
 
 def _output_path(folder: Path, out: Path | str | None) -> Path:
@@ -178,4 +183,6 @@ if __name__ == "__main__":
 #from wav_feature_extraction_pipeline import run_all_wav, batch_extract_wav
 
 #amp_per, ent = run_all_wav("bird1.wav", show_plots=True) #just generates for 1 wav file
-#json_path = batch_extract_wav("recordings/", show_plots=False)
+#wav_folder_path = "/Users/mirandahulsey-vincent/Documents/allPythonCode/BYOD_class_clean/data_inputs"
+#from wav_feature_extraction_pipeline import run_all_wav, batch_extract_wav
+#json_path = batch_extract_wav("recordings/", show_plots=True)
