@@ -15,7 +15,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
-
+from scipy.io import wavfile
 import numpy as np   # needed by _json_ready()
 
 # ────────────────────────────────────────────────────────────────
@@ -117,12 +117,19 @@ def batch_extract_wav(
 
     for wav in sorted(folder.glob("*.wav")):
         try:
+            # Get duration
+            sr, data = wavfile.read(str(wav))
+            duration_seconds = len(data) / sr
+    
+            # Run feature extraction
             amp_per, ent = run_all_wav(wav, show_plots=show_plots)
             metrics = _json_ready(_merge_metrics(amp_per, ent))
+    
             results.append(
                 {
                     "file_name": wav.name,
                     "file_path": str(wav.resolve()),
+                    "duration_seconds": duration_seconds,
                     "metrics": metrics,
                 }
             )
@@ -185,4 +192,4 @@ if __name__ == "__main__":
 #amp_per, ent = run_all_wav("bird1.wav", show_plots=True) #just generates for 1 wav file
 #wav_folder_path = "/Users/mirandahulsey-vincent/Documents/allPythonCode/BYOD_class_clean/data_inputs"
 #from wav_feature_extraction_pipeline import run_all_wav, batch_extract_wav
-#json_path = batch_extract_wav("recordings/", show_plots=True)
+#json_path = batch_extract_wav(wav_folder_path, show_plots=True)
