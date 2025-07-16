@@ -85,7 +85,7 @@ def mask_to_spans(mask: np.ndarray, t: np.ndarray) -> List[Tuple[float, float]]:
 def calculate_wav_spectrogram_entropy(
     wav_path: str | Path,
     *,
-    smoothing_sigma: float = 200,
+    smoothing_sigma: float = 100,
     shannon_threshold_bits: float = 8.0,
     wiener_threshold_log: float = -4,
     plot_shannon_figure: bool = True,
