@@ -27,8 +27,8 @@ try:
         calculate_wav_spectrogram_amplitude_and_periodicity,
     )
     # Shannon + Wiener entropy
-    from calculate_wav_dual_entropy import (
-        calculate_wav_spectrogram_entropy,
+    from calculate_wav_dual_entropy import ( 
+        calculate_wav_dual_entropy,
     )
 except ModuleNotFoundError:
     print(
@@ -68,7 +68,7 @@ def run_all_wav(wav_path: Path | str, *, show_plots: bool = False):
         plot_amplitude_figure=show_plots,
         plot_periodicity_figure=show_plots,
     )
-    ent = calculate_wav_spectrogram_entropy(
+    ent = calculate_wav_dual_entropy(
         wav_path,
         plot_shannon_figure=show_plots,
         plot_wiener_figure=show_plots,
@@ -186,10 +186,11 @@ if __name__ == "__main__":
     ]
     _cli()
 
-
+#just running on 1 .wav file:
 #from wav_feature_extraction_pipeline import run_all_wav, batch_extract_wav
-
 #amp_per, ent = run_all_wav("bird1.wav", show_plots=True) #just generates for 1 wav file
+
+#running on a folder of .wav files:
 #wav_folder_path = "/Users/mirandahulsey-vincent/Documents/allPythonCode/BYOD_class_clean/data_inputs"
 #from wav_feature_extraction_pipeline import run_all_wav, batch_extract_wav
 #json_path = batch_extract_wav(wav_folder_path, show_plots=True)

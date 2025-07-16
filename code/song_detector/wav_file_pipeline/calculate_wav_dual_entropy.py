@@ -78,11 +78,12 @@ def mask_to_spans(mask: np.ndarray, t: np.ndarray) -> List[Tuple[float, float]]:
         spans.append((t0, t[-1]))
     return spans
 
+# ---------------------------------------------------------------------------
+# MAIN – wav‑only dual entropy *with optional band‑pass*
+# ---------------------------------------------------------------------------
+from typing import Optional
 
-# ────────────────────────────────────────────────────────────────────────
-# MAIN – wav-only (linear-spectrogram) dual entropy
-# ────────────────────────────────────────────────────────────────────────
-def calculate_wav_spectrogram_entropy(
+def calculate_wav_dual_entropy(
     wav_path: str | Path,
     *,
     smoothing_sigma: float = 100,
@@ -90,50 +91,72 @@ def calculate_wav_spectrogram_entropy(
     wiener_threshold_log: float = -4,
     plot_shannon_figure: bool = True,
     plot_wiener_figure: bool = True,
-    **spec_kw,  # forwarded to generate_spectrogram_from_wav
+    bandpass_low: Optional[float] = 700,   # Hz (e.g. 700)
+    bandpass_high: Optional[float] = 7000,  # Hz (e.g. 7000)
+    # -----------------------------------------------------------------------
+    **spec_kw,                      # forwarded to generate_spectrogram_from_wav
 ) -> SpectrogramEntropyData:
     """
     Parameters
     ----------
     wav_path : str | pathlib.Path
         Path to a .wav file.
+    bandpass_low, bandpass_high : float | None
+        If both are not None, the spectrogram is restricted to the frequency
+        range [bandpass_low, bandpass_high] Hz before any entropy calculation.
+        Pass None to skip band‑passing.
     **spec_kw :
         Extra keyword args for `generate_spectrogram_from_wav`.
     """
-    wav_path = Path(wav_path)
+    wav_path = Path(wav_path).expanduser()
     if wav_path.suffix.lower() != ".wav":
         raise ValueError(f"{wav_path} is not a .wav file")
 
-    # 1) Build linear 0-1 spectrogram ---------------------------------------------
+    # 1) Build linear 0‑1 spectrogram --------------------------------------
     spec_dict = generate_spectrogram_from_wav(wav_path, **spec_kw)
-    S_norm    = spec_dict["spectrogram"]      # already linear 0–1
-    f         = spec_dict["frequencies"]
-    t         = spec_dict["times"]
+    S_norm = spec_dict["spectrogram"]          # already linear 0–1
+    f      = spec_dict["frequencies"]
+    t      = spec_dict["times"]
     title_tag = wav_path.name
+
+    # 2) OPTIONAL: hard frequency band‑pass (spectrogram domain) -----------
+    if bandpass_low is not None and bandpass_high is not None:
+        if bandpass_low >= bandpass_high:
+            raise ValueError("`bandpass_low` must be < `bandpass_high`")
+        band_mask = (f >= bandpass_low) & (f <= bandpass_high)
+        if not band_mask.any():
+            raise ValueError(
+                f"No spectrogram bins fall inside [{bandpass_low}, {bandpass_high}] Hz; "
+                "check your cut‑offs or spectrogram settings."
+            )
+        S_norm = S_norm[band_mask, :]
+        f      = f[band_mask]
 
     eps = np.finfo(float).eps
 
-    # 2) Shannon entropy -----------------------------------------------------------
-    P_linear = S_norm + eps                                # linear power
+    # 3) Shannon entropy ---------------------------------------------------
+    P_linear = S_norm + eps
     P_prob   = P_linear / P_linear.sum(axis=0, keepdims=True)
 
-    sh_bits       = shannon_entropy(P_prob, base=2, axis=0)
-    sh_bits_sm    = gaussian_filter1d(sh_bits, sigma=smoothing_sigma)
-    sh_mask       = sh_bits_sm < shannon_threshold_bits
-    sh_spans      = mask_to_spans(sh_mask, t)
+    sh_bits    = shannon_entropy(P_prob, base=2, axis=0)
+    sh_bits_sm = gaussian_filter1d(sh_bits, sigma=smoothing_sigma)
+    sh_mask    = sh_bits_sm < shannon_threshold_bits
+    sh_spans   = mask_to_spans(sh_mask, t)
 
-    # 3) Wiener entropy ------------------------------------------------------------
-    arith_mean    = P_linear.mean(axis=0) + eps
-    geom_mean     = np.exp(np.log(P_linear + eps).mean(axis=0))
-    wiener_log    = np.log10(geom_mean / arith_mean)
-    wiener_sm     = gaussian_filter1d(wiener_log, sigma=smoothing_sigma)
-    w_mask        = wiener_sm < wiener_threshold_log
-    w_spans       = mask_to_spans(w_mask, t)
+    # 4) Wiener entropy ----------------------------------------------------
+    arith_mean = P_linear.mean(axis=0) + eps
+    geom_mean  = np.exp(np.log(P_linear + eps).mean(axis=0))
+    wiener_log = np.log10(geom_mean / arith_mean)
+    wiener_sm  = gaussian_filter1d(wiener_log, sigma=smoothing_sigma)
+    w_mask     = wiener_sm < wiener_threshold_log
+    w_spans    = mask_to_spans(w_mask, t)
 
-    # 4) Plot helper ---------------------------------------------------------------
+    # 5) Plot helper -------------------------------------------------------
     def _plot(raw, sm, thr, spans, ylabel, title):
-        fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True,
-                                gridspec_kw=dict(height_ratios=[1, 2]))
+        fig, axs = plt.subplots(
+            2, 1, figsize=(10, 6), sharex=True,
+            gridspec_kw=dict(height_ratios=[1, 2])
+        )
         ticks = np.linspace(t[0], t[-1], 6)
 
         axs[0].plot(t, raw, color="gray", alpha=0.4, label="Raw")
@@ -161,15 +184,12 @@ def calculate_wav_spectrogram_entropy(
 
     if plot_shannon_figure:
         _plot(sh_bits, sh_bits_sm, shannon_threshold_bits, sh_spans,
-              "Shannon entropy (bits)",
-              f"Shannon Entropy – {title_tag}")
-
+              "Shannon entropy (bits)", f"Shannon Entropy – {title_tag}")
     if plot_wiener_figure:
         _plot(wiener_log, wiener_sm, wiener_threshold_log, w_spans,
-              "log₁₀(Flatness)",
-              f"Wiener Entropy – {title_tag}")
+              "log₁₀(Flatness)", f"Wiener Entropy – {title_tag}")
 
-    # 5) Package results -----------------------------------------------------------
+    # 6) Package results ---------------------------------------------------
     return SpectrogramEntropyData(
         shannon_entropy_bits=sh_bits,
         shannon_entropy_bits_smoothed=sh_bits_sm,
@@ -181,3 +201,6 @@ def calculate_wav_spectrogram_entropy(
         frequencies=f,
         spectrogram=S_norm,
     )
+
+#wav_path = "/Users/mirandahulsey-vincent/Documents/allPythonCode/BYOD_class_clean/data_inputs/USA5510_unsegmented_songs/55_subsample/USA5510_45755.25666577_4_8_7_7_46.wav"
+#result = calculate_wav_dual_entropy(wav_path,smoothing_sigma=50,bandpass_low=700, bandpass_high=7000,)
