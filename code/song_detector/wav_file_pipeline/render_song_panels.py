@@ -1,286 +1,190 @@
 # -*- coding: utf-8 -*-
-# render_song_panels.py
-"""
-Render stacked spectrogram "panels" from WAVs described in a detector JSON.
-
-JSON schema (yours, auto-detected):
-  - filename: str  (e.g., "USA5288_45355.32428022_3_4_9_0_28.wav")
-  - song_present: bool
-  - segments: list of [start_sec, end_sec] (or list of {"start": s, "end": e})
-  - spec_parameters: optional (unused here)
-
-Core features
--------------
-- Robust path handling: absolute or relative basenames under wav_dir (recursive search fallback).
-- Optional filter `only_song_present=True` to include only entries that clearly contain song.
-- Overlays yellow translucent spans for song intervals; optional `pad_before_after_sec`.
-- Band-pass filter with Butterworth IIR (filtfilt) before spectrogram.
-- Panels are fixed time-length slices; multiple panels per figure (stacked rows).
-- Dashed red vertical lines at panel boundaries for visual anchoring.
-
-Dependencies: numpy, scipy, matplotlib, soundfile
-"""
-
+# render_song_panels.py  ·  streaming aggregated panels (full-width, bottom-only axes)
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Union, Optional, List, Tuple
+from typing import Union, Optional, List, Tuple, Deque
 
-import json
-import re
-import math
-
+import json, re, math, collections
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, filtfilt, spectrogram
+from scipy.signal import butter, filtfilt, spectrogram, resample_poly
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Tunables (feel free to tweak)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Display / DSP tunables ────────────────────────────────────────────────────
 SPEC_NPERSEG = 1024
 SPEC_NOVERLAP = 512
-SPEC_VMIN_DB, SPEC_VMAX_DB = -90, -20   # dB scale for display
-CMAP = "gray_r"                         # spectrogram colormap
-OVERLAY_ALPHA = 0.28                    # yellow overlay transparency
+SPEC_VMIN_DB, SPEC_VMAX_DB = -90, -20
+CMAP = "gray_r"
+OVERLAY_ALPHA = 0.28
 OVERLAY_COLOR = "yellow"
-
-# Regex for WAV detection in strings
+BOUNDARY_COLOR = "red"
+BOUNDARY_LS = "--"
+BOUNDARY_LW = 0.9
+LABEL_FONTSIZE = 8
 _WAV_RE = re.compile(r"\.wav$", re.IGNORECASE)
 
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+def _entry_has_song(e: dict) -> bool:
+    if e.get("song_present") is True: return True
+    if e.get("contains_song") is True: return True
+    t = e.get("segments") or e.get("detected_song_times") or e.get("song_times")
+    return isinstance(t, list) and len(t) > 0
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers: schema normalization and path resolution
-# ──────────────────────────────────────────────────────────────────────────────
-def _resolve_wav_path(entry: dict, wav_dir: Path, wav_key: str = "filename") -> Path:
-    """
-    Return a Path to the .wav for this entry.
-
-    - If entry[wav_key] is absolute, use directly.
-    - Else try wav_dir / value, then rglob(value's basename) under wav_dir.
-    """
-    if wav_key not in entry:
-        raise KeyError(f"Expected key '{wav_key}' in entry (keys={list(entry.keys())[:10]}...)")
-    v = entry[wav_key]
-    if not isinstance(v, str) or not _WAV_RE.search(v):
-        raise ValueError(f"Entry['{wav_key}'] should be a string ending in .wav (got: {v!r})")
-    p = Path(v)
-    if p.is_absolute():
-        if not p.exists():
-            raise FileNotFoundError(f"Absolute WAV not found: {p}")
-        return p
-    direct = wav_dir / v
-    if direct.exists():
-        return direct
-    hits = list(wav_dir.rglob(Path(v).name))
-    if hits:
-        return hits[0]
-    raise FileNotFoundError(f"Cannot resolve '{v}' under {wav_dir}")
-
-
-def _entry_has_song(entry: dict) -> bool:
-    """Robust truthiness for song content."""
-    if entry.get("song_present") is True:
-        return True
-    if entry.get("contains_song") is True:
-        return True
-    # Fallback to non-empty time windows:
-    times = entry.get("segments") or entry.get("detected_song_times") or entry.get("song_times")
-    return isinstance(times, list) and len(times) > 0
-
-
-def _normalize_times(entry: dict) -> List[Tuple[float, float]]:
-    """
-    Return [(start_sec, end_sec), ...] from any of:
-      - entry["segments"]              == [[s, e], ...]  or [{'start': s, 'end': e}, ...]
-      - entry["detected_song_times"]   == same formats
-      - entry["song_times"]            == same formats
-    Assumes seconds.
-    """
-    raw = entry.get("segments") or entry.get("detected_song_times") or entry.get("song_times") or []
+def _normalize_times(e: dict) -> List[Tuple[float, float]]:
+    raw = e.get("segments") or e.get("detected_song_times") or e.get("song_times") or []
     out: List[Tuple[float, float]] = []
     for item in raw:
         if isinstance(item, (list, tuple)) and len(item) == 2:
-            s, e = float(item[0]), float(item[1])
-            if e > s:
-                out.append((s, e))
-        elif isinstance(item, dict):
-            if "start" in item and "end" in item:
-                s, e = float(item["start"]), float(item["end"])
-                if e > s:
-                    out.append((s, e))
+            s, d = float(item[0]), float(item[1])
+            if d > s: out.append((s, d))
+        elif isinstance(item, dict) and "start" in item and "end" in item:
+            s, d = float(item["start"]), float(item["end"])
+            if d > s: out.append((s, d))
     return out
 
+def _resolve_wav_path(entry: dict, wav_dir: Path, wav_key: str) -> Path:
+    if wav_key not in entry:
+        raise KeyError(f"Missing '{wav_key}' in entry (keys={list(entry.keys())[:10]}...)")
+    v = entry[wav_key]
+    if not isinstance(v, str) or not _WAV_RE.search(v):
+        raise ValueError(f"Entry['{wav_key}'] must be a '.wav' string (got {v!r})")
+    p = Path(v)
+    if p.is_absolute():
+        if not p.exists(): raise FileNotFoundError(p)
+        return p
+    cand = wav_dir / v
+    if cand.exists(): return cand
+    hits = list(wav_dir.rglob(Path(v).name))
+    if hits: return hits[0]
+    raise FileNotFoundError(f"Cannot resolve '{v}' under {wav_dir}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DSP helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _butter_bandpass(lowcut: float, highcut: float, fs: float, order: int = 4):
+# ── Timeline + audio ─────────────────────────────────────────────────────────
+@dataclass
+class TLFile:
+    path: Path
+    fs: float
+    duration: float
+    start: float
+    end: float
+    song_windows: List[Tuple[float, float]]
+    _y_filtered: Optional[np.ndarray] = None
+    _fs_loaded: Optional[float] = None
+
+def _butter_bandpass(lowcut: float, highcut: float, fs: float, order=4):
     nyq = 0.5 * fs
     low = max(1e-9, min(lowcut / nyq, 0.999999))
     high = max(low + 1e-9, min(highcut / nyq, 0.999999))
-    b, a = butter(order, [low, high], btype="band")
-    return b, a
+    b, a = butter(order, [low, high], btype="band"); return b, a
 
-
-def _apply_bandpass(y: np.ndarray, fs: float, low_cut: float, high_cut: float) -> np.ndarray:
-    """Zero-phase band-pass."""
-    if low_cut is None or high_cut is None or low_cut <= 0 or high_cut <= 0 or high_cut <= low_cut:
-        return y
-    b, a = _butter_bandpass(low_cut, high_cut, fs, order=4)
-    # filtfilt requires finite values
+def _apply_bandpass(y: np.ndarray, fs: float, low: float, high: float) -> np.ndarray:
+    if not (low and high) or high <= low or low <= 0 or high <= 0:
+        return np.ascontiguousarray(y, dtype=np.float64)
+    b, a = _butter_bandpass(low, high, fs)
     y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
     return filtfilt(b, a, y, method="gust")
 
+def _load_and_prepare(tlf: TLFile, target_fs: float, low: float, high: float):
+    if tlf._y_filtered is not None and tlf._fs_loaded == target_fs: return
+    y, fs = sf.read(str(tlf.path), always_2d=False)
+    if y.ndim > 1: y = np.mean(y, axis=1)
+    y = _apply_bandpass(y, fs, low, high)
+    if fs != target_fs:
+        up = int(target_fs); dn = int(fs)
+        g = math.gcd(up, dn); up //= g; dn //= g
+        y = resample_poly(y, up, dn); fs = target_fs
+    tlf._y_filtered = np.ascontiguousarray(y, dtype=np.float64); tlf._fs_loaded = fs
 
-def _slice_audio(y: np.ndarray, start_sec: float, end_sec: float, fs: float) -> np.ndarray:
-    i0 = max(0, int(round(start_sec * fs)))
-    i1 = min(len(y), int(round(end_sec * fs)))
-    return y[i0:i1]
-
+def _slice_y(tlf: TLFile, local_start: float, local_end: float) -> np.ndarray:
+    assert tlf._y_filtered is not None and tlf._fs_loaded is not None
+    fs = tlf._fs_loaded
+    i0 = max(0, int(round(local_start * fs))); i1 = min(len(tlf._y_filtered), int(round(local_end * fs)))
+    if i1 <= i0: return np.zeros(1, dtype=np.float64)
+    return tlf._y_filtered[i0:i1]
 
 def _compute_spectrogram(y: np.ndarray, fs: float):
-    """Return (T, F, S_db) where S_db is dB magnitude."""
     if len(y) == 0:
-        # Avoid empty spec
-        return np.array([0.0, 1e-3]), np.array([0.0, 1.0]), np.full((2, 2), SPEC_VMIN_DB, float)
-    f, t, S = spectrogram(
-        y,
-        fs=fs,
-        nperseg=SPEC_NPERSEG,
-        noverlap=SPEC_NOVERLAP,
-        detrend=False,
-        scaling="spectrum",
-        mode="magnitude",
-    )
-    # Convert to dB
-    S_db = 20.0 * np.log10(np.maximum(S, 1e-12))
-    return t, f, S_db
+        return np.array([0.0, 1e-3]), np.array([0.0, 1.0]), np.full((2,2), SPEC_VMIN_DB, float)
+    f, t, S = spectrogram(y, fs=fs, nperseg=SPEC_NPERSEG, noverlap=SPEC_NOVERLAP,
+                          detrend=False, scaling="spectrum", mode="magnitude")
+    S_db = 20.0 * np.log10(np.maximum(S, 1e-12)); return t, f, S_db
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Rendering
-# ──────────────────────────────────────────────────────────────────────────────
-def _draw_overlays(ax, panel_start: float, panel_end: float, windows: List[Tuple[float, float]]):
-    """Draw yellow overlays clipped to [panel_start, panel_end]."""
-    for s, e in windows:
-        if e <= panel_start or s >= panel_end:
+# ── Streaming prep ───────────────────────────────────────────────────────────
+def _entry_iter(items: List[dict], wav_dir: Path, wav_key: str, only_song_present: bool):
+    for e in items:
+        if only_song_present and not _entry_has_song(e): continue
+        try:
+            path = _resolve_wav_path(e, wav_dir, wav_key)
+            info = sf.info(str(path))
+            fs = float(info.samplerate)
+            dur = float(info.frames)/fs if info.frames and fs>0 else 0.0
+            w = _normalize_times(e)
+            yield (path, fs, dur, w)
+        except Exception:
             continue
-        s_clip = max(s, panel_start)
-        e_clip = min(e, panel_end)
-        ax.axvspan(
-            s_clip - panel_start, e_clip - panel_start,
-            color=OVERLAY_COLOR, alpha=OVERLAY_ALPHA, lw=0
-        )
 
+# ── Rendering helpers ─────────────────────────────────────────────────────────
+def _collect_overlays(inter: List[TLFile], p0: float, p1: float) -> List[Tuple[float,float]]:
+    spans: List[Tuple[float,float]] = []
+    for f in inter:
+        for s_local, e_local in f.song_windows:
+            s = f.start + s_local; e = f.start + e_local
+            if e <= p0 or s >= p1: continue
+            s = max(p0, s); e = min(p1, e)
+            if e > s: spans.append((s - p0, e - p0))
+    return spans
 
-def _format_axes(ax, dur: float, fs: float, title: Optional[str] = None):
-    ax.set_xlim(0, dur)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Freq (Hz)")
-    if title:
-        ax.set_title(title, fontsize=10)
-    # Dashed red lines at boundaries
-    ax.axvline(0.0, color="red", ls="--", lw=0.8)
-    ax.axvline(dur, color="red", ls="--", lw=0.8)
+def _collect_boundaries(inter: List[TLFile], p0: float, p1: float) -> List[Tuple[float,str,bool]]:
+    out: List[Tuple[float,str,bool]] = []
+    for f in inter:
+        if p0 < f.start < p1: out.append((f.start - p0, f.path.name, True))
+        if p0 < f.end   < p1: out.append((f.end   - p0, f.path.name, False))
+    out.sort(key=lambda x: x[0]); return out
 
+def _draw_panel(ax, y_panel: np.ndarray, fs: float, p0: float, p1: float,
+                inter: List[TLFile], show_xlabel: bool, show_ylabel: bool):
+    # Spectrogram
+    t, f, S_db = _compute_spectrogram(y_panel, fs)
+    ax.pcolormesh(t, f, S_db, shading="auto", cmap=CMAP, vmin=SPEC_VMIN_DB, vmax=SPEC_VMAX_DB)
 
-def _render_panels_for_file(
-    wav_path: Path,
-    out_dir: Path,
-    segment_duration_sec: float,
-    panels_per_fig: int,
-    low_cut: float,
-    high_cut: float,
-    song_windows: List[Tuple[float, float]],
-    pad_before_after_sec: float,
-) -> List[Path]:
-    """
-    Render stacked spectrogram panels for a single WAV.
-    Returns list of written figure paths.
-    """
-    # Load audio (mono)
-    y, fs = sf.read(str(wav_path), always_2d=False)
-    if y.ndim > 1:
-        # mixdown to mono
-        y = np.ascontiguousarray(np.mean(y, axis=1))
+    # Overlays
+    for s_rel, e_rel in _collect_overlays(inter, p0, p1):
+        ax.axvspan(s_rel, e_rel, color=OVERLAY_COLOR, alpha=OVERLAY_ALPHA, lw=0)
+
+    # File boundaries + labels
+    for x, fname, is_start in _collect_boundaries(inter, p0, p1):
+        ax.axvline(x, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
+        if is_start:
+            ax.text(x + 0.02*(p1-p0), f.max()*0.95, fname, fontsize=LABEL_FONTSIZE,
+                    color=BOUNDARY_COLOR, va="top", ha="left", alpha=0.9)
+        else:
+            ax.plot([x, x], [f.max()*0.98, f.max()], color=BOUNDARY_COLOR, lw=BOUNDARY_LW)
+
+    # Panel edges
+    ax.axvline(0.0, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
+    ax.axvline(p1 - p0, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
+
+    # Formatting: full-width, bottom-only axes
+    ax.set_xlim(0, p1 - p0)
+    ax.margins(x=0)
+
+    if show_xlabel:
+        ax.set_xlabel("Time (s)")
+        ax.tick_params(axis="x", which="both", labelbottom=True)
     else:
-        y = np.ascontiguousarray(y)
+        ax.set_xlabel(None)
+        ax.tick_params(axis="x", which="both", labelbottom=False)
 
-    total_dur = len(y) / float(fs)
-    # Band-pass once globally for speed (panel slices come from filtered y)
-    y_f = _apply_bandpass(y, fs, low_cut, high_cut)
-
-    # Pad overlays
-    if pad_before_after_sec and pad_before_after_sec > 0:
-        windows = [(max(0.0, s - pad_before_after_sec), min(total_dur, e + pad_before_after_sec))
-                   for (s, e) in song_windows]
+    if show_ylabel:
+        ax.set_ylabel("Freq (Hz)")
+        ax.tick_params(axis="y", which="both", labelleft=True)
     else:
-        windows = list(song_windows)
+        ax.set_ylabel(None)
+        ax.tick_params(axis="y", which="both", labelleft=False)
 
-    # Panel starts
-    n_panels = max(1, int(math.ceil(total_dur / segment_duration_sec)))
-    starts = [i * segment_duration_sec for i in range(n_panels)]
-    wrote: List[Path] = []
-
-    # Batch panels per figure
-    for batch_idx in range(0, n_panels, panels_per_fig):
-        batch_starts = starts[batch_idx: batch_idx + panels_per_fig]
-        n_rows = len(batch_starts)
-
-        fig_h = max(2.0 * n_rows, 2.0)  # height scales with rows
-        fig, axes = plt.subplots(n_rows, 1, figsize=(10, fig_h), squeeze=False)
-        axes = axes.ravel()
-
-        for row_i, panel_start in enumerate(batch_starts):
-            panel_end = min(total_dur, panel_start + segment_duration_sec)
-            panel_dur = panel_end - panel_start
-
-            # Slice filtered audio for spectrogram
-            y_seg = _slice_audio(y_f, panel_start, panel_end, fs)
-            t, f, S_db = _compute_spectrogram(y_seg, fs)
-
-            ax = axes[row_i]
-            # Time origin for each panel is 0..panel_dur
-            # map spectrogram t (0..panel_dur) directly
-            pcm = ax.pcolormesh(
-                t, f, S_db,
-                shading="auto", cmap=CMAP, vmin=SPEC_VMIN_DB, vmax=SPEC_VMAX_DB
-            )
-
-            # overlays
-            _draw_overlays(ax, panel_start, panel_end, windows)
-            # formatting
-            title = f"{wav_path.name} · {panel_start:0.2f}–{panel_end:0.2f} s"
-            _format_axes(ax, panel_dur, fs, title=title)
-
-        # Colorbar on the right for the last axes
-        cbar = fig.colorbar(pcm, ax=axes, orientation="vertical", fraction=0.02, pad=0.02)
-        cbar.set_label("Power (dB)")
-
-        # Legend patch for overlays
-        patch = mpatches.Patch(color=OVERLAY_COLOR, alpha=OVERLAY_ALPHA, label="Detected song")
-        axes[0].legend(handles=[patch], loc="upper right", frameon=True, fontsize=9)
-
-        plt.tight_layout()
-
-        # Write figure
-        base = wav_path.stem
-        out_name = f"{base}_panels_{batch_idx // panels_per_fig:03d}.png"
-        out_path = out_dir / out_name
-        fig.savefig(out_path, dpi=200)
-        plt.close(fig)
-
-        wrote.append(out_path)
-
-    return wrote
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Public API (STREAMING) ───────────────────────────────────────────────────
 def process_detector_json(
     wav_dir: Union[str, Path],
     detector_json_path: Union[str, Path],
@@ -291,36 +195,14 @@ def process_detector_json(
     high_cut: float = 8000.0,
     only_song_present: bool = True,
     pad_before_after_sec: float = 0.0,
-    wav_key: str = "filename",   # your JSON uses "filename"
+    wav_key: str = "filename",
+    verbose: bool = True,
+    max_files: Optional[int] = None,
+    max_total_duration_sec: Optional[float] = None,
 ) -> List[Path]:
     """
-    Main entry: read detector JSON and render figures.
-
-    Parameters
-    ----------
-    wav_dir : str | Path
-        Root directory containing WAV files (or subfolders thereof).
-    detector_json_path : str | Path
-        Path to detector JSON (list of dicts).
-    out_dir : str | Path | None
-        Output directory for PNGs. Defaults to wav_dir / "panels".
-    segment_duration_sec : float
-        Duration of each panel in seconds (e.g., 60.0).
-    panels_per_fig : int
-        Number of stacked panels per figure.
-    low_cut, high_cut : float
-        Band-pass cutoff frequencies in Hz. If invalid, no filtering is applied.
-    only_song_present : bool
-        If True, only entries that clearly contain song are rendered.
-    pad_before_after_sec : float
-        Expand each overlay window by this margin on both sides (seconds).
-    wav_key : str
-        Field name holding the WAV name/path (default "filename").
-
-    Returns
-    -------
-    List[Path]
-        Paths to written figures.
+    Streaming renderer. No colorbar or titles. Panels share x; only bottom shows x ticks/label.
+    Only bottom shows y ticks/label; no vertical gap between panels.
     """
     wav_dir = Path(wav_dir).expanduser().resolve()
     detector_json_path = Path(detector_json_path).expanduser().resolve()
@@ -330,34 +212,112 @@ def process_detector_json(
     with detector_json_path.open() as f:
         items = json.load(f)
 
-    # Optional filter
-    if only_song_present:
-        items = [x for x in items if _entry_has_song(x)]
+    feed = _entry_iter(items, wav_dir, wav_key, only_song_present)
 
+    buf: Deque[TLFile] = collections.deque()
+    buf_end_time = 0.0
+    total_files = 0
     written: List[Path] = []
+    target_fs: Optional[float] = None
 
-    for entry in items:
-        # Resolve WAV path (skip if not found)
+    batch_len = segment_duration_sec * panels_per_fig
+    next_panel_start = 0.0
+    batch_idx = 0
+
+    def _append_next() -> bool:
+        nonlocal buf_end_time, total_files, target_fs
         try:
-            wav_path = _resolve_wav_path(entry, wav_dir, wav_key=wav_key)
-        except Exception:
-            continue
+            path, fs, dur, windows = next(feed)
+        except StopIteration:
+            return False
+        if target_fs is None:
+            target_fs = fs
+        if pad_before_after_sec and pad_before_after_sec > 0:
+            windows = [(max(0.0, s - pad_before_after_sec), max(0.0, e + pad_before_after_sec))
+                       for (s, e) in windows]
+        tlf = TLFile(path=path, fs=fs, duration=dur, start=buf_end_time,
+                     end=buf_end_time + dur, song_windows=windows)
+        buf.append(tlf); buf_end_time += dur; total_files += 1
+        return True
 
-        # Overlay windows (seconds)
-        song_windows = _normalize_times(entry)
+    needed_end = next_panel_start + batch_len
+    while buf_end_time < needed_end:
+        if max_files is not None and total_files >= max_files: break
+        if not _append_next(): break
+        if max_total_duration_sec is not None and buf_end_time >= max_total_duration_sec: break
 
-        # Render and collect written files
-        pngs = _render_panels_for_file(
-            wav_path=wav_path,
-            out_dir=out_dir,
-            segment_duration_sec=segment_duration_sec,
-            panels_per_fig=panels_per_fig,
-            low_cut=low_cut,
-            high_cut=high_cut,
-            song_windows=song_windows,
-            pad_before_after_sec=pad_before_after_sec,
-        )
-        written.extend(pngs)
+    if target_fs is None:
+        if verbose: print("[render] No valid audio found.")
+        return []
+
+    while next_panel_start < buf_end_time:
+        p0 = next_panel_start
+        needed_end = p0 + batch_len
+        while buf_end_time < needed_end:
+            if max_files is not None and total_files >= max_files: break
+            if not _append_next(): break
+            if max_total_duration_sec is not None and buf_end_time >= max_total_duration_sec: break
+
+        actual_p1 = min(buf_end_time, needed_end)
+        panel_starts = [p0 + i*segment_duration_sec for i in range(panels_per_fig)
+                        if p0 + i*segment_duration_sec < actual_p1]
+        if not panel_starts: break
+
+        n_rows = len(panel_starts)
+        fig_h = max(2.0 * n_rows, 2.0)
+
+        # sharex=True; remove vertical gaps with hspace=0; minimal margins so panels span width
+        fig, axes = plt.subplots(n_rows, 1, figsize=(11.6, fig_h), squeeze=False, sharex=True)
+        axes = axes.ravel()
+        plt.subplots_adjust(left=0.06, right=0.995, top=0.995, bottom=0.08, hspace=0.0)
+
+        buf_list = list(buf)
+        idx = 0
+        while idx < len(buf_list) and buf_list[idx].end <= panel_starts[0]:
+            idx += 1
+
+        for row_i, t_start in enumerate(panel_starts):
+            t_end = min(t_start + segment_duration_sec, buf_end_time)
+            ax = axes[row_i]
+
+            # files intersecting this panel
+            inter: List[TLFile] = []
+            j = idx
+            while j < len(buf_list) and buf_list[j].start < t_end:
+                if buf_list[j].end > t_start: inter.append(buf_list[j])
+                j += 1
+
+            chunks: List[np.ndarray] = []
+            for fobj in inter:
+                _load_and_prepare(fobj, target_fs, low_cut, high_cut)
+                s = max(fobj.start, t_start); e = min(fobj.end, t_end)
+                chunks.append(_slice_y(fobj, s - fobj.start, e - fobj.start))
+            y_panel = np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float64)
+
+            show_xlabel = (row_i == n_rows - 1)
+            show_ylabel = (row_i == n_rows - 1)  # only bottom shows frequency scale
+            _draw_panel(ax, y_panel, target_fs, t_start, t_end, inter, show_xlabel, show_ylabel)
+
+            while idx < len(buf_list) and buf_list[idx].end <= t_start:
+                idx += 1
+
+        # Keep overlay legend (remove if you want)
+        patch = mpatches.Patch(color=OVERLAY_COLOR, alpha=OVERLAY_ALPHA, label="Detected song")
+        axes[0].legend(handles=[patch], loc="upper right", frameon=True, fontsize=9)
+
+        out_name = f"aggregated_panels_{batch_idx:03d}.png"
+        out_path = out_dir / out_name
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        if verbose: print(f"[render] Wrote {out_path}")
+        written.append(out_path)
+
+        next_panel_start += batch_len
+        while buf and buf[0].end <= next_panel_start: buf.popleft()
+        batch_idx += 1
+
+        if max_total_duration_sec is not None and next_panel_start >= max_total_duration_sec: break
+        if not buf and next_panel_start >= buf_end_time: break
 
     return written
 
@@ -375,12 +335,14 @@ written = process_detector_json(
     detector_json_path=detector_json,
     out_dir=out_dir,
     segment_duration_sec=60,
-    panels_per_fig=10,
-    low_cut=700,
-    high_cut=7000,
+    panels_per_fig=5,
+    low_cut=700,     # can match the view...
+    high_cut=2000,   # ...but not required
     only_song_present=True,
     pad_before_after_sec=0.0,
-    wav_key="filename",   # explicit, matches your JSON
+    wav_key="filename",
+    verbose=True,
+    max_files=50,
 )
 print(f"Wrote {len(written)} figure(s). First few:", written[:3])
 
