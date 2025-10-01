@@ -1,313 +1,325 @@
-# render_n_song_panels_per_day_fast.py
-# Generate per-day stacks of n spectrogram panels (first or random picks).
-# - Gaussian nperseg=2048, hop=119, white background (percentile/gamma shaped)
-# - Fixed y-lims 0..10 kHz
-# - Filename above each panel in red; only bottom panel shows x-axis
-# - Keeps rows with song_present==True even if 'segments' is empty
-# - Fast basename index (case-insensitive)
-
 from __future__ import annotations
-
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Iterable
-import collections, re, json, math, random
+from typing import List, Dict, Tuple, Optional
+
+import json
+import math
+import random
+from datetime import datetime, timedelta
 
 import numpy as np
 import soundfile as sf
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram, windows
 
-# ── Spectrogram/display tunables (match your preferred look) ─────────────────
+# ── Spectrogram/display tunables ──────────────────────────────────────────────
 SPEC_NPERSEG   = 2048
-SPEC_NOOVERLAP = SPEC_NPERSEG - 119             # hop = 119 samples
+SPEC_NOOVERLAP = SPEC_NPERSEG - 119
 SPEC_WINDOW    = windows.gaussian(SPEC_NPERSEG, std=SPEC_NPERSEG/8)
 
 Y_MIN = 0.0
 Y_MAX = 10_000.0
+CMAP  = "gray"          # 0=black, 1=white (we invert below to get white background)
 
-# Robust display mapping → white background, darker for louder sound
-PCTL_LO = 12.0    # raise = whiter bg (10–20 typical)
+# Robust normalization (white background)
+PCTL_LO = 12.0
 PCTL_HI = 99.5
-GAMMA   = 0.75    # <1 brightens background; >1 darkens
+GAMMA   = 0.20          # <1 brightens background
 
-CMAP = "gray"     # 0=black, 1=white (we'll invert in mapping to make loud darker)
+# Styling
+BOUNDARY_COLOR = "red"
+BOUNDARY_LS    = "--"
+BOUNDARY_LW    = 0.9
+LABEL_FONTSIZE = 8
 
-# Labels
-TITLE_COLOR   = "red"
-TITLE_FONTSZ  = 8
-OVERLAY_COLOR = "yellow"   # (not used here, kept for parity)
-OVERLAY_ALPHA = 0.28
 
-# ── Filename parsing: "USA5288_45355.33299256_3_4_9_14_59.wav" ───────────────
-#  - Group(1) animal ID, Group(2) Excel serial (float-like string)
-_NAME_RE = re.compile(r"^([A-Za-z0-9]+)_(\d+(?:\.\d+)?)_", re.IGNORECASE)
-
-def _parse_name(basename: str) -> Optional[Tuple[str, float]]:
-    m = _NAME_RE.match(basename)
-    if not m: return None
-    animal = m.group(1)
-    serial = float(m.group(2))
-    return animal, serial
-
-# Excel serial date → date (no timezone). Excel's day 0 = 1899-12-30
-from datetime import datetime, timedelta
-def _excel_serial_to_date(serial: float):
-    origin = datetime(1899, 12, 30)  # Excel system
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _excel_serial_to_date(serial: float) -> datetime.date:
+    origin = datetime(1899, 12, 30)
     return (origin + timedelta(days=float(serial))).date()
 
-# ── JSON helpers ─────────────────────────────────────────────────────────────
-def _normalize_times(e: dict) -> List[Tuple[float, float]]:
-    raw = e.get("segments") or e.get("detected_song_times") or e.get("song_times") or []
-    out: List[Tuple[float, float]] = []
-    for item in raw:
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            s, d = float(item[0]), float(item[1])
-            if d > s: out.append((s, d))
-        elif isinstance(item, dict) and "start" in item and "end" in item:
-            s, d = float(item["start"]), float(item["end"])
-            if d > s: out.append((s, d))
-    return out
+def _parse_day_from_basename(name: str) -> Optional[str]:
+    """
+    Expected basename pattern: {animal}_{excelSerial}_{...}.wav
+    Returns 'YYYY-MM-DD' or None if it can't be parsed.
+    """
+    try:
+        stem = Path(name).stem
+        parts = stem.split("_")
+        if len(parts) < 2:
+            return None
+        serial = float(parts[1])
+        return _excel_serial_to_date(serial).isoformat()
+    except Exception:
+        return None
 
-def _get_wav_basename(e: dict, wav_key: str) -> Optional[str]:
-    v = e.get(wav_key)
-    if not isinstance(v, str): return None
-    return Path(v).name
-
-# ── WAV indexing (once; case-insensitive filenames) ──────────────────────────
 def _index_wavs(wav_dir: Path) -> Dict[str, Path]:
-    idx: Dict[str, Path] = {}
-    # Index common extensions (lower/upper)
-    for ext in ("*.wav", "*.WAV"):
-        for p in wav_dir.rglob(ext):
-            idx[p.name.lower()] = p
-    return idx
+    index: Dict[str, Path] = {}
+    for p in wav_dir.rglob("*.wav"):
+        index[p.name.lower()] = p
+    for p in wav_dir.rglob("*.WAV"):
+        index[p.name.lower()] = p
+    return index
 
-def _resolve_path_by_basename(basename: str, index: Dict[str, Path]) -> Optional[Path]:
-    return index.get(basename.lower())
+def _load_json_rows(json_path: Path) -> List[dict]:
+    with json_path.open("r") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = list(data.values())
+    return data
 
-# ── Spectrogram helper: robust percentiles → white bg, loud darker ───────────
-def _spec_disp(y: np.ndarray, fs: float):
-    if y.size == 0:
-        # Minimal image
-        f = np.array([0.0, 1.0], float)
-        t = np.array([0.0, 1e-3], float)
-        S_disp = np.ones((2, 2), float)  # white
-        return t, f, S_disp
+def _pick_n(items: List[dict], n: int, mode: str, rng: random.Random) -> List[dict]:
+    if mode.lower() == "random":
+        if len(items) <= n:
+            return items[:]
+        picks = items[:]
+        rng.shuffle(picks)
+        return picks[:n]
+    return items[:n]
 
+
+# ── Audio → Spectrogram (white background, full file) ─────────────────────────
+def _spectrogram_disp(y: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(y) == 0:
+        return np.array([0.0, 1e-3]), np.array([0.0, 1.0]), np.ones((2, 2), float)
     f, t, S = spectrogram(
         y, fs=fs,
-        window=SPEC_WINDOW,
-        nperseg=SPEC_NPERSEG,
-        noverlap=SPEC_NOOVERLAP,
-        detrend=False,
-        scaling="spectrum",
+        window=SPEC_WINDOW, nperseg=SPEC_NPERSEG, noverlap=SPEC_NOOVERLAP,
+        detrend=False, scaling="spectrum",
     )
     S_db = 10.0 * np.log10(S + np.finfo(float).eps)
-
     lo = np.percentile(S_db, PCTL_LO)
     hi = np.percentile(S_db, PCTL_HI)
     if hi <= lo:
         lo, hi = S_db.min(), S_db.max() + 1e-6
-
     S_norm = np.clip((S_db - lo) / (hi - lo), 0.0, 1.0)
-    # invert + gamma: background→white, loud→darker
     S_disp = (1.0 - S_norm) ** GAMMA
     return t, f, S_disp
 
-# ── Panel render (single subplot) ────────────────────────────────────────────
-def _render_panel(ax, y: np.ndarray, fs: float, animal: str, basename: str, start_s: float, end_s: float):
-    t, f, S_disp = _spec_disp(y, fs)
-    # Crop vertically 0..10 kHz
-    m = (f >= Y_MIN) & (f <= Y_MAX)
-    if not np.any(m): m = slice(None)
-    f_view = f[m]
-    S_view = S_disp[m, :]
 
-    ax.imshow(
-        S_view, origin="lower", aspect="auto", interpolation="nearest",
-        extent=(0.0, (end_s - start_s), float(f_view[0]), float(f_view[-1])),
-        cmap=CMAP, vmin=0.0, vmax=1.0
-    )
+# ── Blank panel ────────────────────────────────────────────────────────────────
+def _render_blank_panel(ax: plt.Axes):
     ax.set_facecolor("white")
+    ax.set_xlim(0, 1)
     ax.set_ylim(Y_MIN, Y_MAX)
-    ax.set_xlim(0.0, (end_s - start_s))
-    ax.margins(x=0)
-    # Filename title (red) above the panel
-    ax.set_title(basename, color=TITLE_COLOR, fontsize=TITLE_FONTSZ, pad=2)
+    ax.set_yticks([0, 2000, 4000, 6000, 8000, 10000])
+    ax.set_xticks([])
     ax.set_ylabel("Freq (Hz)")
 
-# ── Load a segment quickly (mono) ────────────────────────────────────────────
-def _load_segment(path: Path, start_s: float, end_s: float) -> Tuple[np.ndarray, float]:
-    """Read [start_s, end_s) from WAV. Falls back to full read if needed."""
-    # soundfile supports seeking by frames; read only what we need
-    info = sf.info(str(path))
-    fs = float(info.samplerate)
-    i0 = max(0, int(round(start_s * fs)))
-    i1 = max(i0, int(round(end_s * fs)))
-    frames = i1 - i0
-    if frames <= 0:
-        return np.zeros(0, dtype=np.float64), fs
-    with sf.SoundFile(str(path), "r") as f:
-        f.seek(i0)
-        y = f.read(frames, dtype="float64", always_2d=False)
-    if y.ndim > 1:
-        y = y.mean(axis=1)
-    return np.ascontiguousarray(y, dtype=np.float64), fs
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Main API (packed layout) ──────────────────────────────────────────────────
 def render_n_song_panels_per_day(
     wav_dir: Path,
     detector_json_path: Path,
     out_dir: Path,
-    n_per_day: int,
-    selection: str = "first",       # or "random"
+    n_per_day: int = 6,
+    selection: str = "first",         # or "random"
     seed: int = 42,
-    segment_pad_sec: float = 0.7,   # pad around first segment (if present)
-    min_panel_dur_sec: float = 4.0, # enforce minimum panel duration
-    low_cut: Optional[float] = None,  # kept for signature parity (unused here)
-    high_cut: Optional[float] = None, # we rely on the display band 0..10k
-    wav_key: str = "filename",
-    only_song_present: bool = True,
+    panels_per_png: int = 6,
+    panel_duration_sec: float = 10.0, # fixed x-span per panel
     dpi: int = 300,
+    only_song_present: bool = False,
+    wav_key: str = "filename",
     verbose: bool = True,
 ) -> List[Path]:
-
-    wav_dir = Path(wav_dir).expanduser().resolve()
-    out_dir = Path(out_dir).expanduser().resolve()
+    """
+    Packs multiple recordings *sequentially* into each panel until `panel_duration_sec`
+    is filled; then continues on the next panel. Red dashed lines mark the start and
+    end of each recording wherever those fall inside a panel.
+    """
+    rng = random.Random(seed)
+    wav_dir = wav_dir.expanduser().resolve()
+    out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load JSON
-    rows = json.load(open(detector_json_path, "r"))
+    # Index audio
     if verbose:
-        print(f"[json] rows={len(rows)} from {detector_json_path}")
-
-    # Build index once (basenames → path)
-    idx = _index_wavs(wav_dir)
+        print("[index] scanning wavs...")
+    wav_index = _index_wavs(wav_dir)
     if verbose:
-        print(f"[index] Found {len(idx)} wav files; indexed {len(idx)} names (case-insensitive)")
+        print(f"[index] indexed {len(wav_index)} wav files")
 
-    # Bucket by day
-    day_buckets: Dict[object, List[dict]] = collections.defaultdict(list)
-    kept = 0
-    missing = 0
-    sample_missing: List[str] = []
+    # Load JSON and bucket by day
+    rows = _load_json_rows(detector_json_path)
+    buckets: Dict[str, List[dict]] = {}
+    missing: List[str] = []
 
-    for e in rows:
-        basename = _get_wav_basename(e, wav_key)
-        if not basename:
+    for r in rows:
+        fn = r.get(wav_key)
+        if not isinstance(fn, str):
             continue
-
-        segs = _normalize_times(e)
-        # IMPORTANT: keep if song_present True OR segments non-empty
-        has_positive = (e.get("song_present") is True) or bool(segs)
-        if only_song_present and not has_positive:
+        base = Path(fn).name
+        day = _parse_day_from_basename(base)
+        if day is None:
             continue
-
-        p = _resolve_path_by_basename(basename, idx)
+        if only_song_present and not bool(r.get("song_present")):
+            continue
+        p = wav_index.get(base.lower())
         if p is None:
-            missing += 1
-            if len(sample_missing) < 5:
-                sample_missing.append(basename)
+            missing.append(base)
             continue
-
-        parsed = _parse_name(basename)
-        if not parsed:
-            continue
-        animal, serial = parsed
-        day = _excel_serial_to_date(serial)
-
-        e2 = dict(e)
-        e2["_path"] = p
-        e2["_basename"] = basename
-        e2["_animal"] = animal
-        e2["_serial"] = serial
-        e2["_segments"] = segs  # may be empty; we'll fallback when rendering
-        day_buckets[day].append(e2)
-        kept += 1
+        buckets.setdefault(day, []).append({"_basename": base, "_path": p})
 
     if verbose:
-        print(f"[filter] kept={kept}, missing_files={missing}, days={len(day_buckets)}")
-        if sample_missing:
-            print("[filter] sample missing basenames:", sample_missing)
+        print(f"[filter] days={len(buckets)}, kept_rows={sum(len(v) for v in buckets.values())}, "
+              f"missing_files={len(missing)}")
+        if missing[:5]:
+            print("[filter] sample missing:", missing[:5])
 
-    if kept == 0:
-        print("[warn] No usable items after filtering. Check wav_key/paths/segments.")
-        return []
-
-    # Selection per day
-    rng = random.Random(seed)
     written: List[Path] = []
 
-    for day, items in sorted(day_buckets.items(), key=lambda kv: kv[0]):
-        # deterministic order: by serial then by basename
-        items.sort(key=lambda d: (d["_serial"], d["_basename"]))
-        if selection.lower() == "random":
-            picks = items[:]
-            rng.shuffle(picks)
-            picks = picks[:n_per_day]
-        else:
-            picks = items[:n_per_day]
-        if not picks:
-            continue
+    # Iterate days deterministically
+    for day in sorted(buckets.keys()):
+        items = buckets[day]
+        items.sort(key=lambda d: d["_basename"])
+        picks = _pick_n(items, n_per_day, selection, rng)
 
-        # Create a figure with len(picks) stacked panels
-        n_rows = len(picks)
-        fig_h = max(2.0 * n_rows, 2.0)
-        fig, axes = plt.subplots(n_rows, 1, figsize=(11.6, fig_h), squeeze=False, sharex=False)
-        axes = axes.ravel()
-        plt.subplots_adjust(left=0.06, right=0.995, top=0.98, bottom=0.08, hspace=0.0)
+        # Precompute spectrograms once per selected recording
+        packed = []
+        for it in picks:
+            wav_path = it["_path"]
+            try:
+                y, fs = sf.read(str(wav_path), always_2d=False)
+                if y.ndim > 1:
+                    y = np.mean(y, axis=1)
+                y = y.astype(float, copy=False)
+                t, f_hz, S_disp = _spectrogram_disp(y, float(fs))
+                rec_total = float(t[-1]) if t.size else 0.0
+            except Exception:
+                # placeholder on error
+                t = np.array([0.0, 1e-3])
+                f_hz = np.array([0.0, 1.0])
+                S_disp = np.ones((2, 2), float)
+                rec_total = 0.0
+            packed.append(dict(path=wav_path, t=t, f=f_hz, S=S_disp, dur=rec_total))
 
-        for row_i, e in enumerate(picks):
-            ax = axes[row_i]
-
-            # Decide the panel time window
-            info = sf.info(str(e["_path"]))
-            fs = float(info.samplerate)
-            total_dur = float(info.frames)/fs if info.frames and fs > 0 else 0.0
-            segs = e["_segments"] or [(0.0, min(10.0, total_dur))]  # fallback if none
-            s0, s1 = segs[0]
-            # pad
-            s0 = max(0.0, s0 - segment_pad_sec)
-            s1 = min(total_dur, s1 + segment_pad_sec)
-            # enforce minimum duration
-            if (s1 - s0) < min_panel_dur_sec:
-                mid = 0.5*(s0 + s1)
-                s0 = max(0.0, mid - 0.5*min_panel_dur_sec)
-                s1 = min(total_dur, mid + 0.5*min_panel_dur_sec)
-
-            # Load just the needed samples
-            y, fs_seg = _load_segment(e["_path"], s0, s1)
-            # (Optional band-pass omitted for speed; 0–10 kHz view already enforced)
-
-            _render_panel(ax, y, fs_seg, e["_animal"], e["_basename"], s0, s1)
-
-            # Only bottom panel shows x-axis ticks/label
-            if row_i == n_rows - 1:
-                ax.set_xlabel("Time (s)")
-                ax.tick_params(axis="x", which="both", labelbottom=True)
-            else:
+        # Helper: new page & saving
+        def _new_page(page_idx: int):
+            fig_h = max(1.8 * panels_per_png, 2.0)
+            fig, axes = plt.subplots(
+                panels_per_png, 1, figsize=(11.6, fig_h), squeeze=False, sharex=False
+            )
+            axes = axes.ravel()
+            for ax in axes:
+                # standard look
+                ax.set_facecolor("white")
+                ax.set_ylim(Y_MIN, Y_MAX)
+                ax.set_yticks([0, 2000, 4000, 6000, 8000, 10000])
+                ax.set_ylabel("Freq (Hz)")
+                ax.set_xlim(0.0, float(panel_duration_sec))
+            # x labels only on bottom
+            for ax in axes[:-1]:
                 ax.set_xlabel(None)
                 ax.tick_params(axis="x", which="both", labelbottom=False)
+            axes[-1].set_xlabel("Time (s)")
+            return fig, axes
 
-        # File naming
-        day_str = str(day)
-        mode = "random" if selection.lower() == "random" else "first"
-        out_name = f"{picks[0]['_animal']}_{day_str}_{mode}_n{n_rows}.png"
-        out_path = out_dir / out_name
-        fig.savefig(out_path, dpi=dpi)
-        plt.close(fig)
-        written.append(out_path)
+        def _save_page(fig, axes, page_idx: int, n_pages_hint: Optional[int] = None):
+            title = f"{day} — {selection} {n_per_day} (packed)"
+            if n_pages_hint is not None:
+                title += f" · page {page_idx} of {n_pages_hint}"
+            fig.suptitle(title, fontsize=12, y=0.995)
+            plt.subplots_adjust(left=0.06, right=0.995, top=0.96, bottom=0.08, hspace=0.20)
+            out_path = out_dir / f"{day}_{selection}_{n_per_day}_packed_part{page_idx}.png"
+            fig.savefig(out_path, dpi=dpi)
+            plt.close(fig)
+            written.append(out_path)
+            if verbose:
+                print("[write]", out_path)
 
-    if verbose:
-        print(f"[done] wrote {len(written)} file(s) to {out_dir}")
+        # Render packed
+        if not packed:
+            # emit a blank page
+            fig, axes = _new_page(1)
+            for ax in axes:
+                _render_blank_panel(ax)
+                ax.set_xlim(0.0, float(panel_duration_sec))
+            _save_page(fig, axes, 1, 1)
+            continue
+
+        page_idx = 1
+        fig, axes = _new_page(page_idx)
+        ax_i = 0
+        x_cursor = 0.0
+        panels_used = 1  # count current panel
+
+        def _advance_panel():
+            nonlocal fig, axes, ax_i, x_cursor, page_idx, panels_used
+            ax_i += 1
+            if ax_i >= panels_per_png:
+                _save_page(fig, axes, page_idx)
+                page_idx += 1
+                fig, axes = _new_page(page_idx)
+                ax_i = 0
+            x_cursor = 0.0
+            panels_used += 1
+
+        for rec in packed:
+            t = rec["t"]; f_hz = rec["f"]; S_disp = rec["S"]; dur = rec["dur"]
+            pos = 0.0
+            first_chunk = True
+            while pos < max(dur, 1e-9):
+                # how much room left on the current panel
+                room = panel_duration_sec - x_cursor
+                take = min(room, dur - pos)
+                # slice in time [pos, pos+take]
+                if take > 0.0:
+                    mask_t = (t >= pos) & (t <= pos + take + 1e-9)
+                    if np.any(mask_t):
+                        t_sel = t[mask_t]
+                        S_sel = S_disp[:, mask_t]
+                        # frequency crop
+                        mask_f = (f_hz >= Y_MIN) & (f_hz <= Y_MAX)
+                        if not np.any(mask_f):
+                            mask_f = slice(None)
+                        f_view = f_hz[mask_f]
+                        S_view = S_sel[mask_f, :]
+
+                        # extent maps into [x_cursor, x_cursor + draw_len]
+                        draw_len = float(t_sel[-1] - t_sel[0]) if t_sel.size > 1 else take
+                        axes[ax_i].imshow(
+                            S_view, origin="lower", aspect="auto", interpolation="nearest",
+                            extent=(x_cursor, x_cursor + draw_len,
+                                    float(f_view[0]), float(f_view[-1])),
+                            cmap=CMAP, vmin=0.0, vmax=1.0
+                        )
+
+                    # boundary markers inside this panel chunk
+                    if first_chunk:
+                        # start boundary
+                        axes[ax_i].axvline(x_cursor, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
+                        # filename label
+                        axes[ax_i].text(
+                            x_cursor + 0.02 * panel_duration_sec, 0.98 * Y_MAX,
+                            rec["path"].name, fontsize=LABEL_FONTSIZE,
+                            color=BOUNDARY_COLOR, va="top"
+                        )
+
+                    # end boundary if the recording ends in this chunk
+                    if abs((pos + take) - dur) < 1e-9:
+                        axes[ax_i].axvline(x_cursor + take, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
+
+                    x_cursor += take
+                    pos += take
+                    first_chunk = False
+
+                # advance to next panel if no room remains
+                if x_cursor >= panel_duration_sec - 1e-12 and pos < dur - 1e-12:
+                    _advance_panel()
+
+            # if exactly filled the panel, move to a fresh one for the next recording
+            if x_cursor >= panel_duration_sec - 1e-12:
+                _advance_panel()
+
+        # pad blanks to finish the last page neatly
+        # (no need to know total pages ahead of time; we save the last page now)
+        _save_page(fig, axes, page_idx)
 
     return written
 
 
-
-
 # ── Example usage ────────────────────────────────────────────────────────────
+# -*- coding: utf-8 -*-
 """
 from pathlib import Path
 from render_n_song_panels_per_day_fast import render_n_song_panels_per_day
@@ -316,20 +328,18 @@ wav_dir       = Path("/Volumes/ROSE1-SSD/USA5288/")
 detector_json = Path("/Volumes/ROSE1-SSD/USA5288/USA5288_song_detection.json")
 out_dir       = Path("/Volumes/ROSE1-SSD/USA5288/panels_per_day_fast")
 
-# FIRST n songs per day
 written = render_n_song_panels_per_day(
     wav_dir=wav_dir,
     detector_json_path=detector_json,
     out_dir=out_dir,
-    n_per_day=20,
-    selection="first",      # or "random"
-    seed=42,                # used for "random"
-    segment_pad_sec=0.7,
-    min_panel_dur_sec=4.0,
-    low_cut=700, high_cut=7000,   # kept for parity; display is 0–10 kHz
+    n_per_day=20,                 # select N recordings per day
+    selection="first",            # 'first' or 'random'
+    panels_per_png=6,             # rows per PNG
+    panel_duration_sec=10.0,      # fixed timescale per panel
     dpi=300,
+    only_song_present=True,       # require song_present in JSON
     verbose=True,
 )
-print("Wrote:", len(written), "files")
-
+print(f"Wrote {len(written)} PNGs")
+print("First few:", written[:3])
 """
