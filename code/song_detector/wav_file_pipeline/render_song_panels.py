@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# render_song_panels.py · streaming aggregated panels (Gaussian 2048; hop=119; 0–10 kHz; pure-white background)
+# render_song_panels.py · streaming aggregated panels
+# (Gaussian 2048; hop=119; 0–10 kHz; white background; filenames ABOVE panels)
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -12,25 +13,23 @@ import soundfile as sf
 from scipy.signal import spectrogram, windows, butter, filtfilt, resample_poly
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.transforms import blended_transform_factory
 
 # ── Spectrogram/display tunables ──────────────────────────────────────────────
 SPEC_NPERSEG   = 2048
 SPEC_NOOVERLAP = SPEC_NPERSEG - 119              # hop = 119 samples
 SPEC_WINDOW    = windows.gaussian(SPEC_NPERSEG, std=SPEC_NPERSEG/8)
-CMAP           = "binary"                        # 0=white, 1=black (after our invert below)
+CMAP           = "gray"                           # 0=black, 1=white
 SAVE_DPI       = 450
 
 # View band (Hz)
 Y_MIN = 0.0
 Y_MAX = 10_000.0
 
-# Robust normalization + display shaping
-# 1) subtract a per-frequency noise floor estimated from this percentile
-NOISEFLOOR_PCTL = 15.0       # raise (e.g., 20–30) to make background even whiter
-# 2) normalize by a high percentile (robust to outliers)
+# Robust normalization + display shaping (controls background whiteness)
+PCTL_LO = 12.0     # raise for whiter background (typ. 10–20)
 PCTL_HI = 99.5
-# 3) contrast curve (post-normalization)
-GAMMA   = 0.75               # <1 brightens; >1 darkens
+GAMMA   = 0.10     # <1 brightens background; >1 darkens
 
 # Overlays / labels
 OVERLAY_ALPHA  = 0.28
@@ -120,36 +119,26 @@ def _slice_y(tlf: TLFile, local_start: float, local_end: float) -> np.ndarray:
     if i1 <= i0: return np.zeros(1, dtype=np.float64)
     return tlf._y_filtered[i0:i1]
 
-# ── Spectrogram helper: per-frequency noise-floor subtraction + robust norm ──
+# ── Spectrogram helper: robust percentiles + invert + gamma ──────────────────
 def _compute_spec_gauss_norm(y: np.ndarray, fs: float):
     if len(y) == 0:
         return np.array([0.0, 1e-3]), np.array([0.0, 1.0]), np.ones((2, 2), float)
-
     f, t, S = spectrogram(
         y, fs=fs,
         window=SPEC_WINDOW, nperseg=SPEC_NPERSEG, noverlap=SPEC_NOOVERLAP,
-        detrend=False, scaling="spectrum"
+        detrend=False, scaling="spectrum",
     )
-    # dB-like scale for robustness
     S_db = 10.0 * np.log10(S + np.finfo(float).eps)
-
-    # 1) per-frequency noise floor (percentile over time), then subtract
-    floor = np.percentile(S_db, NOISEFLOOR_PCTL, axis=1, keepdims=True)
-    S_rel = S_db - floor
-    S_rel[S_rel < 0] = 0.0                      # everything at/below floor → pure white
-
-    # 2) normalize by a high percentile of the remaining energy
-    hi = np.percentile(S_rel, PCTL_HI)
-    if not np.isfinite(hi) or hi <= 1e-12:
-        hi = 1.0
-    S_norm = np.clip(S_rel / hi, 0.0, 1.0)
-
-    # 3) invert + gamma so strong energy is dark, silence white
-    S_disp = S_norm ** GAMMA          # GAMMA ~ 0.7–0.9: more contrast without crushing
+    lo = np.percentile(S_db, PCTL_LO)
+    hi = np.percentile(S_db, PCTL_HI)
+    if hi <= lo: lo, hi = S_db.min(), S_db.max() + 1e-6
+    S_norm = np.clip((S_db - lo) / (hi - lo), 0.0, 1.0)
+    S_disp = (1.0 - S_norm) ** GAMMA  # silence→1 (white), louder→darker
     return t, f, S_disp
 
 # ── STREAMING PREP ───────────────────────────────────────────────────────────
 def _entry_iter(items: List[dict], wav_dir: Path, wav_key: str, only_song_present: bool):
+    """Yield (path, fs, duration, windows) for each usable entry in JSON."""
     for e in items:
         if only_song_present and not _entry_has_song(e):
             continue
@@ -196,23 +185,36 @@ def _draw_panel(ax, y_panel: np.ndarray, fs: float, p0: float, p1: float,
     )
     ax.set_facecolor("white")
     ax.set_ylim(Y_MIN, Y_MAX)
-    y_top = ax.get_ylim()[1]
+    ax.set_xlim(0, p1 - p0)
+    ax.margins(x=0)
 
+    # Overlays
     for s_rel, e_rel in _collect_overlays(inter, p0, p1):
         ax.axvspan(s_rel, e_rel, color=OVERLAY_COLOR, alpha=OVERLAY_ALPHA, lw=0)
 
+    # Prepare transform for labels ABOVE the panel (x=data, y=axes)
+    trans_xdata_yaxes = blended_transform_factory(ax.transData, ax.transAxes)
+
+    # File boundaries + labels
     for x, fname, is_start in _collect_boundaries(inter, p0, p1):
         ax.axvline(x, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
         if is_start:
-            ax.text(x + 0.02*(p1-p0), y_top*0.95, fname, fontsize=LABEL_FONTSIZE,
-                    color=BOUNDARY_COLOR, va="top", ha="left", alpha=0.9)
+            ax.text(
+                x + 0.02*(p1 - p0), 1.02, fname,
+                transform=trans_xdata_yaxes,  # x in data, y just above axes
+                fontsize=LABEL_FONTSIZE, color=BOUNDARY_COLOR,
+                va="bottom", ha="left", alpha=0.9,
+                clip_on=False, zorder=5
+            )
         else:
-            ax.plot([x, x], [y_top*0.98, y_top], color=BOUNDARY_COLOR, lw=BOUNDARY_LW)
+            # tiny end tick inside axes coordinates
+            ax.plot([x, x], [0.98, 1.0], transform=ax.get_yaxis_transform(),
+                    color=BOUNDARY_COLOR, lw=BOUNDARY_LW)
 
+    # Panel edges & axes
     ax.axvline(0.0, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
     ax.axvline(p1 - p0, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
-    ax.set_xlim(0, p1 - p0)
-    ax.margins(x=0)
+
     if show_xlabel:
         ax.set_xlabel("Time (s)"); ax.tick_params(axis="x", which="both", labelbottom=True)
     else:
@@ -235,6 +237,13 @@ def process_detector_json(
     max_files: Optional[int] = None,
     max_total_duration_sec: Optional[float] = None,
 ) -> List[Path]:
+    """
+    Writes figures of stacked spectrogram panels across a concatenated timeline.
+    - Gaussian window (nperseg=2048, hop=119)
+    - 0–10 kHz y-limits for all panels
+    - White background with robust percentile+gamma normalization
+    - File names drawn just ABOVE each panel at file boundaries
+    """
     wav_dir = Path(wav_dir).expanduser().resolve()
     detector_json_path = Path(detector_json_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve() if out_dir is not None else (wav_dir / "panels")
@@ -300,7 +309,8 @@ def process_detector_json(
 
         fig, axes = plt.subplots(n_rows, 1, figsize=(11.6, fig_h), squeeze=False, sharex=True)
         axes = axes.ravel()
-        plt.subplots_adjust(left=0.06, right=0.995, top=0.98, bottom=0.08, hspace=0.14)
+        # a little extra space so above-panel filenames have room
+        plt.subplots_adjust(left=0.06, right=0.995, top=0.98, bottom=0.08, hspace=0.18)
 
         buf_list = list(buf)
         idx = 0
@@ -349,6 +359,7 @@ def process_detector_json(
     return written
 
 
+# ── Example usage (commented) ────────────────────────────────────────────────
 """
 from pathlib import Path
 from render_song_panels import process_detector_json
@@ -361,7 +372,7 @@ written = process_detector_json(
     wav_dir=wav_dir,
     detector_json_path=detector_json,
     out_dir=out_dir,
-    segment_duration_sec=30,
+    segment_duration_sec=20,
     panels_per_fig=5,
     low_cut=700,
     high_cut=7000,
@@ -372,5 +383,4 @@ written = process_detector_json(
     max_files=50,
 )
 print(f"Wrote {len(written)} figure(s). First few:", written[:3])
-
 """
