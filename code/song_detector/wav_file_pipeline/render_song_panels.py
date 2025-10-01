@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# render_song_panels.py  ·  streaming aggregated panels (full-width, bottom-only axes)
+# render_song_panels.py · streaming aggregated panels (Gaussian 2048, hop=119; 0–10 kHz; robust normalization)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,21 +9,33 @@ from typing import Union, Optional, List, Tuple, Deque
 import json, re, math, collections
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, filtfilt, spectrogram, resample_poly
+from scipy.signal import spectrogram, windows, butter, filtfilt, resample_poly
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-# ── Display / DSP tunables ────────────────────────────────────────────────────
-SPEC_NPERSEG = 1024
-SPEC_NOVERLAP = 512
-SPEC_VMIN_DB, SPEC_VMAX_DB = -90, -20
-CMAP = "gray_r"
-OVERLAY_ALPHA = 0.28
-OVERLAY_COLOR = "yellow"
+# ── Spectrogram/display tunables (match your reference) ───────────────────────
+SPEC_NPERSEG   = 2048
+SPEC_NOOVERLAP = SPEC_NPERSEG - 119              # hop = 119 samples
+SPEC_WINDOW    = windows.gaussian(SPEC_NPERSEG, std=SPEC_NPERSEG/8)
+CMAP           = "binary"                        # black features on white bg
+SAVE_DPI       = 450
+
+# View band (Hz)
+Y_MIN = 0.0
+Y_MAX = 10_000.0
+
+# Robust display normalization (percentiles, amplitude-invariant)
+PCTL_LO = 5.0
+PCTL_HI = 99.5
+
+# Overlays / labels
+OVERLAY_ALPHA  = 0.28
+OVERLAY_COLOR  = "yellow"
 BOUNDARY_COLOR = "red"
-BOUNDARY_LS = "--"
-BOUNDARY_LW = 0.9
+BOUNDARY_LS    = "--"
+BOUNDARY_LW    = 0.9
 LABEL_FONTSIZE = 8
+
 _WAV_RE = re.compile(r"\.wav$", re.IGNORECASE)
 
 # ── JSON helpers ──────────────────────────────────────────────────────────────
@@ -61,7 +73,7 @@ def _resolve_wav_path(entry: dict, wav_dir: Path, wav_key: str) -> Path:
     if hits: return hits[0]
     raise FileNotFoundError(f"Cannot resolve '{v}' under {wav_dir}")
 
-# ── Timeline + audio ─────────────────────────────────────────────────────────
+# ── Timeline + audio helpers ──────────────────────────────────────────────────
 @dataclass
 class TLFile:
     path: Path
@@ -77,7 +89,8 @@ def _butter_bandpass(lowcut: float, highcut: float, fs: float, order=4):
     nyq = 0.5 * fs
     low = max(1e-9, min(lowcut / nyq, 0.999999))
     high = max(low + 1e-9, min(highcut / nyq, 0.999999))
-    b, a = butter(order, [low, high], btype="band"); return b, a
+    b, a = butter(order, [low, high], btype="band")
+    return b, a
 
 def _apply_bandpass(y: np.ndarray, fs: float, low: float, high: float) -> np.ndarray:
     if not (low and high) or high <= low or low <= 0 or high <= 0:
@@ -95,23 +108,41 @@ def _load_and_prepare(tlf: TLFile, target_fs: float, low: float, high: float):
         up = int(target_fs); dn = int(fs)
         g = math.gcd(up, dn); up //= g; dn //= g
         y = resample_poly(y, up, dn); fs = target_fs
-    tlf._y_filtered = np.ascontiguousarray(y, dtype=np.float64); tlf._fs_loaded = fs
+    tlf._y_filtered = np.ascontiguousarray(y, dtype=np.float64)
+    tlf._fs_loaded = fs
 
 def _slice_y(tlf: TLFile, local_start: float, local_end: float) -> np.ndarray:
     assert tlf._y_filtered is not None and tlf._fs_loaded is not None
     fs = tlf._fs_loaded
-    i0 = max(0, int(round(local_start * fs))); i1 = min(len(tlf._y_filtered), int(round(local_end * fs)))
+    i0 = max(0, int(round(local_start * fs)))
+    i1 = min(len(tlf._y_filtered), int(round(local_end * fs)))
     if i1 <= i0: return np.zeros(1, dtype=np.float64)
     return tlf._y_filtered[i0:i1]
 
-def _compute_spectrogram(y: np.ndarray, fs: float):
+# ── Spectrogram helper (Gaussian 2048/std=256, hop=119) with robust norm ─────
+def _compute_spec_gauss_norm(y: np.ndarray, fs: float):
     if len(y) == 0:
-        return np.array([0.0, 1e-3]), np.array([0.0, 1.0]), np.full((2,2), SPEC_VMIN_DB, float)
-    f, t, S = spectrogram(y, fs=fs, nperseg=SPEC_NPERSEG, noverlap=SPEC_NOVERLAP,
-                          detrend=False, scaling="spectrum", mode="magnitude")
-    S_db = 20.0 * np.log10(np.maximum(S, 1e-12)); return t, f, S_db
+        return np.array([0.0, 1e-3]), np.array([0.0, 1.0]), np.zeros((2, 2), float)
+    f, t, Sxx = spectrogram(
+        y, fs=fs,
+        window=SPEC_WINDOW,
+        nperseg=SPEC_NPERSEG,
+        noverlap=SPEC_NOOVERLAP,
+        detrend=False,
+        scaling="spectrum",   # same as your reference
+    )
+    Sxx_db = 10.0 * np.log10(Sxx + np.finfo(float).eps)
 
-# ── Streaming prep ───────────────────────────────────────────────────────────
+    # Percentile-based display range (amplitude-invariant)
+    lo = np.percentile(Sxx_db, PCTL_LO)
+    hi = np.percentile(Sxx_db, PCTL_HI)
+    if hi <= lo:        # fallback if audio is silent
+        lo, hi = Sxx_db.min(), Sxx_db.max() + 1e-6
+
+    S_norm = np.clip((Sxx_db - lo) / (hi - lo), 0.0, 1.0)
+    return t, f, S_norm
+
+# ── Streaming prep ────────────────────────────────────────────────────────────
 def _entry_iter(items: List[dict], wav_dir: Path, wav_key: str, only_song_present: bool):
     for e in items:
         if only_song_present and not _entry_has_song(e): continue
@@ -144,10 +175,27 @@ def _collect_boundaries(inter: List[TLFile], p0: float, p1: float) -> List[Tuple
     out.sort(key=lambda x: x[0]); return out
 
 def _draw_panel(ax, y_panel: np.ndarray, fs: float, p0: float, p1: float,
-                inter: List[TLFile], show_xlabel: bool, show_ylabel: bool):
-    # Spectrogram
-    t, f, S_db = _compute_spectrogram(y_panel, fs)
-    ax.pcolormesh(t, f, S_db, shading="auto", cmap=CMAP, vmin=SPEC_VMIN_DB, vmax=SPEC_VMAX_DB)
+                inter: List[TLFile], show_xlabel: bool):
+    t, f, S = _compute_spec_gauss_norm(y_panel, fs)
+
+    # Crop to 0–10 kHz BEFORE plotting
+    f_mask = (f >= Y_MIN) & (f <= Y_MAX)
+    if not np.any(f_mask): f_mask = slice(None)
+    S_view = S[f_mask, :]
+    f_view = f[f_mask]
+
+    ax.imshow(
+        S_view,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        extent=(t[0], t[-1], float(f_view[0]), float(f_view[-1])),
+        cmap=CMAP,
+    )
+
+    # Identical y-limits across panels
+    ax.set_ylim(Y_MIN, Y_MAX)
+    y_top = ax.get_ylim()[1]
 
     # Overlays
     for s_rel, e_rel in _collect_overlays(inter, p0, p1):
@@ -157,32 +205,24 @@ def _draw_panel(ax, y_panel: np.ndarray, fs: float, p0: float, p1: float,
     for x, fname, is_start in _collect_boundaries(inter, p0, p1):
         ax.axvline(x, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
         if is_start:
-            ax.text(x + 0.02*(p1-p0), f.max()*0.95, fname, fontsize=LABEL_FONTSIZE,
-                    color=BOUNDARY_COLOR, va="top", ha="left", alpha=0.9)
+            ax.text(x + 0.02*(p1-p0), y_top*0.95, fname,
+                    fontsize=LABEL_FONTSIZE, color=BOUNDARY_COLOR,
+                    va="top", ha="left", alpha=0.9)
         else:
-            ax.plot([x, x], [f.max()*0.98, f.max()], color=BOUNDARY_COLOR, lw=BOUNDARY_LW)
+            ax.plot([x, x], [y_top*0.98, y_top], color=BOUNDARY_COLOR, lw=BOUNDARY_LW)
 
-    # Panel edges
+    # Panel edges & axes
     ax.axvline(0.0, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
     ax.axvline(p1 - p0, color=BOUNDARY_COLOR, ls=BOUNDARY_LS, lw=BOUNDARY_LW)
-
-    # Formatting: full-width, bottom-only axes
     ax.set_xlim(0, p1 - p0)
     ax.margins(x=0)
-
     if show_xlabel:
         ax.set_xlabel("Time (s)")
         ax.tick_params(axis="x", which="both", labelbottom=True)
     else:
         ax.set_xlabel(None)
         ax.tick_params(axis="x", which="both", labelbottom=False)
-
-    if show_ylabel:
-        ax.set_ylabel("Freq (Hz)")
-        ax.tick_params(axis="y", which="both", labelleft=True)
-    else:
-        ax.set_ylabel(None)
-        ax.tick_params(axis="y", which="both", labelleft=False)
+    ax.set_ylabel("Freq (Hz)")
 
 # ── Public API (STREAMING) ───────────────────────────────────────────────────
 def process_detector_json(
@@ -201,8 +241,8 @@ def process_detector_json(
     max_total_duration_sec: Optional[float] = None,
 ) -> List[Path]:
     """
-    Streaming renderer. No colorbar or titles. Panels share x; only bottom shows x ticks/label.
-    Only bottom shows y ticks/label; no vertical gap between panels.
+    Streaming renderer with robust, amplitude-invariant spectrogram normalization.
+    Panels share x; only the bottom shows the timescale. View is 0–10 kHz.
     """
     wav_dir = Path(wav_dir).expanduser().resolve()
     detector_json_path = Path(detector_json_path).expanduser().resolve()
@@ -212,6 +252,7 @@ def process_detector_json(
     with detector_json_path.open() as f:
         items = json.load(f)
 
+    # generator over JSON entries (optionally filtered)
     feed = _entry_iter(items, wav_dir, wav_key, only_song_present)
 
     buf: Deque[TLFile] = collections.deque()
@@ -240,6 +281,7 @@ def process_detector_json(
         buf.append(tlf); buf_end_time += dur; total_files += 1
         return True
 
+    # prime buffer to cover first batch
     needed_end = next_panel_start + batch_len
     while buf_end_time < needed_end:
         if max_files is not None and total_files >= max_files: break
@@ -266,10 +308,9 @@ def process_detector_json(
         n_rows = len(panel_starts)
         fig_h = max(2.0 * n_rows, 2.0)
 
-        # sharex=True; remove vertical gaps with hspace=0; minimal margins so panels span width
         fig, axes = plt.subplots(n_rows, 1, figsize=(11.6, fig_h), squeeze=False, sharex=True)
         axes = axes.ravel()
-        plt.subplots_adjust(left=0.06, right=0.995, top=0.995, bottom=0.08, hspace=0.0)
+        plt.subplots_adjust(left=0.06, right=0.995, top=0.98, bottom=0.08, hspace=0.14)
 
         buf_list = list(buf)
         idx = 0
@@ -280,13 +321,14 @@ def process_detector_json(
             t_end = min(t_start + segment_duration_sec, buf_end_time)
             ax = axes[row_i]
 
-            # files intersecting this panel
+            # which files contribute to this panel
             inter: List[TLFile] = []
             j = idx
             while j < len(buf_list) and buf_list[j].start < t_end:
                 if buf_list[j].end > t_start: inter.append(buf_list[j])
                 j += 1
 
+            # assemble audio for [t_start, t_end)
             chunks: List[np.ndarray] = []
             for fobj in inter:
                 _load_and_prepare(fobj, target_fs, low_cut, high_cut)
@@ -295,19 +337,17 @@ def process_detector_json(
             y_panel = np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float64)
 
             show_xlabel = (row_i == n_rows - 1)
-            show_ylabel = (row_i == n_rows - 1)  # only bottom shows frequency scale
-            _draw_panel(ax, y_panel, target_fs, t_start, t_end, inter, show_xlabel, show_ylabel)
+            _draw_panel(ax, y_panel, target_fs, t_start, t_end, inter, show_xlabel)
 
             while idx < len(buf_list) and buf_list[idx].end <= t_start:
                 idx += 1
 
-        # Keep overlay legend (remove if you want)
         patch = mpatches.Patch(color=OVERLAY_COLOR, alpha=OVERLAY_ALPHA, label="Detected song")
         axes[0].legend(handles=[patch], loc="upper right", frameon=True, fontsize=9)
 
         out_name = f"aggregated_panels_{batch_idx:03d}.png"
         out_path = out_dir / out_name
-        fig.savefig(out_path, dpi=200)
+        fig.savefig(out_path, dpi=SAVE_DPI)
         plt.close(fig)
         if verbose: print(f"[render] Wrote {out_path}")
         written.append(out_path)
@@ -322,6 +362,7 @@ def process_detector_json(
     return written
 
 
+
 """
 from pathlib import Path
 from render_song_panels import process_detector_json
@@ -334,10 +375,10 @@ written = process_detector_json(
     wav_dir=wav_dir,
     detector_json_path=detector_json,
     out_dir=out_dir,
-    segment_duration_sec=60,
+    segment_duration_sec=30,
     panels_per_fig=5,
-    low_cut=700,     # can match the view...
-    high_cut=2000,   # ...but not required
+    low_cut=700,
+    high_cut=7000,
     only_song_present=True,
     pad_before_after_sec=0.0,
     wav_key="filename",
