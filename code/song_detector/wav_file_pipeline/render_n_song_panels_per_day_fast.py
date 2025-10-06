@@ -324,15 +324,15 @@ def render_n_song_panels_per_day(
 from pathlib import Path
 from render_n_song_panels_per_day_fast import render_n_song_panels_per_day
 
-wav_dir       = Path("/Volumes/ROSE1-SSD/USA5288/")
-detector_json = Path("/Volumes/ROSE1-SSD/USA5288/USA5288_song_detection.json")
-out_dir       = Path("/Volumes/ROSE1-SSD/USA5288/panels_per_day_fast")
+wav_dir       = Path("/Volumes/GLABSSD/Gardner_447D_Comp1_Comp2_and_laptop_SONGS_24June2025/2025_AreaX/R08_RC6_Comp2")
+detector_json = Path("/Users/mirandahulsey-vincent/Desktop/R08_RC6_Comp2_song_detection.json")
+out_dir       = Path("/Users/mirandahulsey-vincent/Desktop/R08_panels_per_day_fast")
 
 written = render_n_song_panels_per_day(
     wav_dir=wav_dir,
     detector_json_path=detector_json,
     out_dir=out_dir,
-    n_per_day=20,                 # select N recordings per day
+    n_per_day=10,                 # select N recordings per day
     selection="first",            # 'first' or 'random'
     panels_per_png=6,             # rows per PNG
     panel_duration_sec=10.0,      # fixed timescale per panel
@@ -342,4 +342,5 @@ written = render_n_song_panels_per_day(
 )
 print(f"Wrote {len(written)} PNGs")
 print("First few:", written[:3])
+
 """
